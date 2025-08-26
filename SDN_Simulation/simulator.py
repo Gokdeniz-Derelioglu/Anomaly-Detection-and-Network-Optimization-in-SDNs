@@ -278,19 +278,53 @@ def build_multiroute_topology():
 
 # ------------- Policy / Hooks -------------
 
-def suspicion_score_hook(packet_features) -> float:
-    
-    #LSTM MODEL INTEGRATION POINT:    
 
-     import torch
-     from real_project import LSTMClassifier 
+#-------------------------------------------
+# Input Policy 
+#-------------------------------------------
+import torch
+import sys, os
+from real_project.finishedModel import AdvancedLSTM
+
+# ✅ Load model ONCE globally (not inside function, so it doesn’t reload every call)
+MODEL_PATH = "saved_models/lstm_sdn_model1.pth"  
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load the trained model
+model = AdvancedLSTM(
+    input_dim=78,     # number of features in your CICIDS input (minus label)
+    hidden_dim=64,
+    num_layers=2,
+    output_dim=1
+)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+model.to(device)
+model.eval()
+
+
+def prepare_features(packet_features, seq_len=8):
+    """
+    Convert single packet (feature vector) into model-ready format.
+    If model expects sequences, buffer multiple packets before passing them here.
+    """
+    # Convert to tensor shape [1, seq_len, input_dim]
+    features_tensor = torch.tensor(packet_features, dtype=torch.float32)
     
-     # Convert features to model input format
-     model_input = prepare_features(packet_features)
-     
-    # Run inference
+    # If it's just one packet (1D), expand to sequence length
+    if features_tensor.ndim == 1:
+        features_tensor = features_tensor.unsqueeze(0).repeat(seq_len, 1)
+    
+    features_tensor = features_tensor.unsqueeze(0).to(device)  # [batch=1, seq_len, input_dim]
+    return features_tensor
+
+
+def suspicion_score_hook(packet_features) -> float:
+    """
+    Take packet features -> return suspicion score in [0,1]
+    """
     with torch.no_grad():
-         suspicion_score = model(model_input).item() 
+        model_input = prepare_features(packet_features)
+        suspicion_score = torch.sigmoid(model(model_input)).item()
     return suspicion_score
 
 def dqn_action_hook(state, candidate_paths):
