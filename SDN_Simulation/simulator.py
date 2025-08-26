@@ -407,25 +407,11 @@ class Simulator:
             self.flow_accum -= 1.0
             self.inject_flow()
 
+    # ---- inject_flow ----
     def inject_flow(self, src=None, dst=None, size=None):
         src = src or self.host_src
         dst = dst or self.host_dst
         size = size or random.randint(*FLOW_SIZE_BYTES)
-
-        # Compute candidate paths
-        k_paths = self.graph.k_shortest_paths(src, dst, k=8, pkt_size=size)
-        if not k_paths:
-            return
-
-        # Build state for DQN (simple for now)
-        state = {
-            "policy_mode": self.policy_mode,
-            "link_loads": {k: self.graph.links[k].in_flight for k in self.graph.links},
-            "network_congestion": sum(link.in_flight for link in self.graph.links.values()) / len(self.graph.links),
-        }
-        chosen_idx = dqn_action_hook(state, k_paths)
-        chosen_idx = max(0, min(chosen_idx, len(k_paths) - 1))
-        path = k_paths[chosen_idx]
 
         # Suspicion score using LSTM
         features = {
@@ -436,13 +422,8 @@ class Simulator:
         }
         sus = suspicion_score_hook(features)
 
-        # Apply three-zone classification:
-        # - score >= upper_thresh -> DROP (auto-block malicious)
-        # - lower_thresh <= score < upper_thresh -> QUARANTINE (suspicious, needs review)
-        # - score < lower_thresh -> ALLOW (benign)
-        
+        # Apply three-zone classification
         if sus >= self.upper_thresh:
-            # DROP: Definitely malicious
             self.stats["dropped"] += 1
             self.recent_events.append({
                 "type": "DROPPED",
@@ -455,45 +436,101 @@ class Simulator:
             self.next_pid += 1
             return
         elif sus >= self.lower_thresh:
-            # QUARANTINE: Suspicious, allow but mark for monitoring
             self.stats["quarantined"] += 1
             self.recent_events.append({
-                "type": "QUARANTINED", 
+                "type": "QUARANTINED",
                 "packet_id": self.next_pid,
                 "suspicion": sus,
                 "reason": f"Medium suspicion ({sus:.3f})",
                 "timestamp": time.time(),
                 "size": size
             })
-            
-        # For benign packets (sus < lower_thresh), we don't add to recent_events
 
-        pkt = Packet(self.next_pid, src, dst, size, path, time.time(), suspicion=sus)
+        # Initialize packet with just source node, DQN will choose next hops dynamically
+        pkt = Packet(self.next_pid, src, dst, size, path_nodes=[src], spawn_t=time.time(), suspicion=sus)
         self.next_pid += 1
         self.packets.append(pkt)
 
-        # Mark entering first link
-        seg = pkt.current_nodes()
-        if seg:
-            link = self.graph.get_link(*seg)
-            link.in_flight += 1
+    def build_packet_state(pkt, graph, max_neighbors=6):
+        """
+        Build a state vector for a DQN per packet at its current node.
 
-    # ---- stepping ----
+        Features included:
+        - Suspicion score
+        - Current node one-hot (or ID normalized)
+        - Destination node one-hot (or ID normalized)
+        - Neighbor links: for up to max_neighbors neighbors:
+            * latency (ms)
+            * bandwidth (Mbps)
+            * congestion (in-flight / bandwidth)
+        - If fewer than max_neighbors, pad with zeros
+        """
+
+        current_node = pkt.path[pkt.segment_index] if pkt.segment_index < len(pkt.path) else pkt.path[-1]
+        dst_node = pkt.dst
+
+        # --- Node encoding (simple ID -> normalized float) ---
+        node_ids = list(graph.nodes.keys())
+        node_idx_map = {nid: i for i, nid in enumerate(node_ids)}
+        num_nodes = len(node_ids)
+
+        curr_idx = node_idx_map[current_node] / max(1, num_nodes-1)
+        dst_idx = node_idx_map[dst_node] / max(1, num_nodes-1)
+
+        # --- Suspicion score ---
+        sus = pkt.suspicion
+
+        # --- Neighbor links ---
+        neighbors = graph.neighbors(current_node)
+        neighbor_features = []
+        for n in neighbors[:max_neighbors]:
+            link = graph.get_link(current_node, n)
+            latency = link.latency_ms / 1000.0      # seconds
+            bw = link.bandwidth_mbps / 1000.0      # scale down to ~1
+            cong = link.in_flight / max(1.0, link.bandwidth_mbps)
+            neighbor_features.extend([latency, bw, cong])
+
+        # Pad if fewer than max_neighbors
+        while len(neighbor_features) < max_neighbors*3:
+            neighbor_features.extend([0.0, 0.0, 0.0])
+
+        # --- Combine all into 1D vector ---
+        state_vector = [sus, curr_idx, dst_idx] + neighbor_features
+        return state_vector
+
+
+    # ---- step_packets ----
     def step_packets(self, dt):
-        """Advance packets along links by normalized progress = dt / travel_time."""
         done = []
         for pkt in self.packets:
             seg = pkt.current_nodes()
-            if not seg:
-                # already at dst
-                continue
-            link = self.graph.get_link(*seg)
-            travel = link.travel_time_sec(pkt.size)
-            if travel <= 0:
-                progress_rate = 1.0
-            else:
-                progress_rate = dt / travel
 
+            # If first step (only src in path), select next hop
+            if seg is None:
+                current_node_id = pkt.path[-1]
+                current_node = self.graph.nodes[current_node_id]
+                neighbors = self.graph.neighbors(current_node_id)
+
+                # Build DQN state
+                state_vector = build_packet_state(pkt, self.graph)
+                chosen_neighbor_idx = dqn_action_hook(state_vector, neighbors)
+                chosen_neighbor_idx = max(0, min(chosen_neighbor_idx, len(neighbors) - 1))
+                next_hop = neighbors[chosen_neighbor_idx]
+
+                # Append to path
+                pkt.path.append(next_hop)
+
+                # Enter first link
+                link = self.graph.get_link(current_node_id, next_hop)
+                link.in_flight += 1
+                pkt.progress = 0.0
+                continue
+
+            # Regular progress along current link
+            a, b = seg
+            link = self.graph.get_link(a, b)
+            travel = link.travel_time_sec(pkt.size)
+            progress_rate = dt / travel if travel > 0 else 1.0
             pkt.progress += progress_rate
 
             if pkt.progress >= 1.0:
@@ -502,24 +539,38 @@ class Simulator:
                 pkt.segment_index += 1
                 pkt.progress = 0.0
 
-                # reached end?
-                if pkt.segment_index >= len(pkt.path) - 1:
+                # reached destination?
+                if pkt.path[-1] == pkt.dst:
                     pkt.finish_t = time.time()
                     done.append(pkt)
                 else:
-                    # enter next link
-                    next_seg = pkt.current_nodes()
-                    if next_seg:
-                        self.graph.get_link(*next_seg).in_flight += 1
+                    # choose next hop dynamically
+                    current_node_id = pkt.path[pkt.segment_index]
+                    neighbors = [n for n in self.graph.neighbors(current_node_id) if n not in pkt.path]
+                    if not neighbors:
+                        # dead-end, drop
+                        pkt.dropped = True
+                        pkt.drop_reason = "No valid next hop"
+                        done.append(pkt)
+                        continue
+                    state_vector = build_packet_state(pkt, self.graph)
+                    chosen_neighbor_idx = dqn_action_hook(state_vector, neighbors)
+                    chosen_neighbor_idx = max(0, min(chosen_neighbor_idx, len(neighbors) - 1))
+                    next_hop = neighbors[chosen_neighbor_idx]
+                    pkt.path.append(next_hop)
+                    self.graph.get_link(current_node_id, next_hop).in_flight += 1
 
-        # finalize delivered
+        # finalize delivered/dropped
         for pkt in done:
             self.packets.remove(pkt)
-            self.stats["delivered"] += 1
-            delay = pkt.finish_t - pkt.spawn_t
-            self.stats["samples"] += 1
-            n = self.stats["samples"]
-            self.stats["avg_delay"] += (delay - self.stats["avg_delay"]) / n
+            if pkt.dropped:
+                self.stats["dropped"] += 1
+            else:
+                self.stats["delivered"] += 1
+                delay = pkt.finish_t - pkt.spawn_t
+                self.stats["samples"] += 1
+                n = self.stats["samples"]
+                self.stats["avg_delay"] += (delay - self.stats["avg_delay"]) / n
 
     def decay_utilization(self, dt):
         # Update a simple utilization metric for link coloring.
