@@ -20,6 +20,12 @@ import math
 import random
 import time
 from collections import defaultdict, deque
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pickle
+import json
+
 
 import pygame
 
@@ -302,6 +308,19 @@ model.to(device)
 model.eval()
 
 
+# ---- instantiate DQNAgent (global) ----
+# state_dim must match build_packet_state length. For default build_packet_state:
+# state_vector = [sus, curr_idx, dst_idx] + max_neighbors*3 neighbor features
+MAX_NEIGHBORS = 6
+state_dim = 1 + 1 + 1 + MAX_NEIGHBORS * 3  # sus, curr_idx, dst_idx + neighbor features
+action_dim = MAX_NEIGHBORS  # keep consistent with build_packet_state
+
+DQN_MODEL_PATH = "saved_models/dqn_agent.pth"  # change path as needed
+dqn_agent = DQNAgent(state_dim=state_dim, action_dim=action_dim, device=device, model_path=None, eps=0.05)
+# optionally: dqn_agent.load(DQN_MODEL_PATH) if you have one
+
+
+
 def prepare_features(packet_features, seq_len=8):
     """
     Convert single packet (feature vector) into model-ready format.
@@ -327,40 +346,85 @@ def suspicion_score_hook(packet_features) -> float:
         suspicion_score = torch.sigmoid(model(model_input)).item()
     return suspicion_score
 
-def dqn_action_hook(state, candidate_paths):
+# ---------------- DQN AGENT (skeleton) ----------------
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, device=None, model_path=None, eps=0.1):
+        self.device = device or torch.device("cpu")
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.eps = eps  # epsilon for greedy fallback
+
+        # Simple MLP Q-network (replace architecture as needed)
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
+        ).to(self.device)
+
+        if model_path and os.path.exists(model_path):
+            try:
+                self.net.load_state_dict(torch.load(model_path, map_location=self.device))
+                self.net.eval()
+            except Exception as e:
+                print("DQNAgent: failed to load model:", e)
+
+    def q_values(self, state_tensor):
+        # state_tensor: torch.tensor([state_dim]) or [batch,state_dim]
+        self.net.eval()
+        with torch.no_grad():
+            st = state_tensor.to(self.device).float()
+            if st.dim() == 1:
+                st = st.unsqueeze(0)
+            q = self.net(st)
+        return q.cpu().numpy()
+
+    def select_action(self, state_vector, candidate_count):
+        """
+        state_vector: 1D numeric vector (numpy array or list)
+        candidate_count: number of neighbors / candidate actions (int)
+        returns: chosen index in range(candidate_count)
+        """
+        import numpy as np
+        # Epsilon-greedy fallback if agent untrained
+        if np.random.rand() < self.eps:
+            return random.randrange(candidate_count)
+
+        st = torch.tensor(state_vector, dtype=torch.float32, device=self.device)
+        q = self.q_values(st)[0]  # shape (action_dim,)
+        # if action_dim > candidate_count, take top candidate_count and choose max among them
+        q = q[:candidate_count]
+        return int(np.argmax(q))
+
+    def save(self, path):
+        torch.save(self.net.state_dict(), path)
+
+    def load(self, path):
+        self.net.load_state_dict(torch.load(path, map_location=self.device))
+        self.net.eval()
+
+
+def dqn_action_hook(state_vector, candidate_neighbors, policy_mode="SHORTEST"):
     """
-    DQN MODEL INTEGRATION POINT:
-    Replace this function with your trained DQN agent.
-    
-    Input: 
-        - state: dict containing network state information:
-            * link_loads: current in-flight packets per link
-            * policy_mode: current routing policy
-            * network_congestion: overall network utilization
-            * Add more state features as needed
-        - candidate_paths: list of possible paths from k-shortest algorithm
-    
-    Output: index (0 to len(candidate_paths)-1) of chosen path
+    state_vector: 1D list/np.array produced by build_packet_state
+    candidate_neighbors: list of neighbor node ids (e.g., ['C','D','E'])
+    Returns: index into candidate_neighbors
     """
-    # TODO: Replace with your DQN agent
-    # Example integration:
-    # 
-    # import torch
-    # from your_dqn import DQNAgent
-    # 
-    # # Convert state to DQN input format
-    # state_tensor = prepare_state(state, candidate_paths)
-    # 
-    # # Get action from trained agent
-    # action = agent.select_action(state_tensor)
-    # 
-    # return action
-    
-    # For now: pick index 0 (greedy) or random if policy_mode is RANDOM.
-    policy = state.get("policy_mode", "SHORTEST")
-    if policy == "RANDOM_K":
-        return random.randrange(len(candidate_paths))
-    return 0
+    # If simulation policy forces RANDOM_K, follow that:
+    if policy_mode == "RANDOM_K":
+        return random.randrange(len(candidate_neighbors))
+
+    # Ensure state_vector length matches dqn_agent.expected dim by padding zeros if needed
+    sv = list(state_vector)
+    if len(sv) < dqn_agent.state_dim:
+        sv = sv + [0.0] * (dqn_agent.state_dim - len(sv))
+
+    # Let DQNAgent pick an index; it returns an index within action_dim
+    chosen_idx = dqn_agent.select_action(sv, candidate_count=len(candidate_neighbors))
+    chosen_idx = max(0, min(chosen_idx, len(candidate_neighbors) - 1))
+    return chosen_idx
+
 
 # ------------- Simulator -------------
 
@@ -400,6 +464,31 @@ class Simulator:
         self.recent_events = deque(maxlen=10)
         self.event_display_time = 3.0  # seconds to show each event
 
+    # 3-zone decision
+    def decision_from_suspicion(sus, lower_thresh, upper_thresh):
+        """
+        returns:
+        "ROUTE"     -> suspicion < lower_thresh
+        "QUARANTINE"-> lower_thresh <= suspicion < upper_thresh
+        "DROP"      -> suspicion >= upper_thresh
+        """
+        if sus >= upper_thresh:
+            return "DROP"
+        elif sus >= lower_thresh:
+            return "QUARANTINE"
+        else:
+            return "ROUTE"
+
+    def choose_quarantine_target(graph, src):
+        # Example: pick the host_dst as quarantine or add a dedicated quarantine node in topology.
+        # If you have a quarantined sink node id (e.g., "QUARANTINE"), prefer that.
+        if "QUARANTINE" in graph.nodes:
+            return "QUARANTINE"
+        # fallback: route to destination host (so it queues there rather than being forwarded)
+        # (you can change this logic to route to an admin honeypot)
+        return None
+
+
     # ---- traffic ----
     def maybe_spawn_background(self, dt):
         self.flow_accum += dt * self.flows_per_sec
@@ -413,17 +502,18 @@ class Simulator:
         dst = dst or self.host_dst
         size = size or random.randint(*FLOW_SIZE_BYTES)
 
-        # Suspicion score using LSTM
+        # Prepare minimal feature vector for LSTM (you may want to craft this better)
         features = {
             "size": size,
             "src": src,
             "dst": dst,
             "timestamp": time.time(),
         }
-        sus = suspicion_score_hook(features)
+        sus = suspicion_score_hook(features)  # returns float in [0,1]
 
-        # Apply three-zone classification
-        if sus >= self.upper_thresh:
+        decision = decision_from_suspicion(sus, self.lower_thresh, self.upper_thresh)
+
+        if decision == "DROP":
             self.stats["dropped"] += 1
             self.recent_events.append({
                 "type": "DROPPED",
@@ -435,7 +525,8 @@ class Simulator:
             })
             self.next_pid += 1
             return
-        elif sus >= self.lower_thresh:
+
+        if decision == "QUARANTINE":
             self.stats["quarantined"] += 1
             self.recent_events.append({
                 "type": "QUARANTINED",
@@ -445,11 +536,19 @@ class Simulator:
                 "timestamp": time.time(),
                 "size": size
             })
+            # You still forward the packet, but mark it as quarantined; the DQN may choose quarantine-specific path.
+            # (we keep packet in simulation but flagged)
+            pkt = Packet(self.next_pid, src, dst, size, path_nodes=[src], spawn_t=time.time(), suspicion=sus)
+            pkt.quarantined = True
+            self.next_pid += 1
+            self.packets.append(pkt)
+            return
 
-        # Initialize packet with just source node, DQN will choose next hops dynamically
+        # else decision == "ROUTE" -> normal routing with DQN for path choice
         pkt = Packet(self.next_pid, src, dst, size, path_nodes=[src], spawn_t=time.time(), suspicion=sus)
         self.next_pid += 1
         self.packets.append(pkt)
+
 
     def build_packet_state(pkt, graph, max_neighbors=6):
         """
@@ -508,19 +607,23 @@ class Simulator:
             # If first step (only src in path), select next hop
             if seg is None:
                 current_node_id = pkt.path[-1]
-                current_node = self.graph.nodes[current_node_id]
                 neighbors = self.graph.neighbors(current_node_id)
+                if not neighbors:
+                    # dead-end - drop
+                    pkt.dropped = True
+                    pkt.drop_reason = "No neighbors at spawn"
+                    done.append(pkt)
+                    continue
 
                 # Build DQN state
-                state_vector = build_packet_state(pkt, self.graph)
-                chosen_neighbor_idx = dqn_action_hook(state_vector, neighbors)
+                state_vector = self.build_packet_state(pkt, self.graph) if hasattr(self, 'build_packet_state') else build_packet_state(pkt, self.graph)
+                # choose action via DQN hook (pass simulator policy_mode for consistency)
+                chosen_neighbor_idx = dqn_action_hook(state_vector, neighbors, policy_mode=self.policy_mode)
                 chosen_neighbor_idx = max(0, min(chosen_neighbor_idx, len(neighbors) - 1))
                 next_hop = neighbors[chosen_neighbor_idx]
 
-                # Append to path
+                # Append to path and start first link
                 pkt.path.append(next_hop)
-
-                # Enter first link
                 link = self.graph.get_link(current_node_id, next_hop)
                 link.in_flight += 1
                 pkt.progress = 0.0
@@ -744,6 +847,33 @@ class Simulator:
         self.stats = {"delivered": 0, "dropped": 0, "quarantined": 0, "avg_delay": 0.0, "samples": 0}
         self.flow_accum = 0.0
         self.recent_events.clear()
+
+
+import pandas as pd, time
+
+class CSVTrafficStream:
+    def __init__(self, csv_path, feature_columns=None, delay=0.0, loop=False):
+        self.df = pd.read_csv(csv_path)
+        self.cols = feature_columns or list(self.df.columns)
+        self.index = 0
+        self.delay = delay
+        self.loop = loop
+
+    def next_packet(self):
+        if self.index >= len(self.df):
+            if self.loop:
+                self.index = 0
+            else:
+                return None
+        row = self.df.iloc[self.index]
+        self.index += 1
+        if self.delay:
+            time.sleep(self.delay)
+        # map row to injector args (size, src, dst...) — you will need to adjust this
+        size = int(row.get("size", random.randint(*FLOW_SIZE_BYTES)))
+        # optionally get src/dst mapping if included in CSV
+        return {"size": size, "src": row.get("src", None), "dst": row.get("dst", None), "raw_row": row.to_dict()}
+
 
 # ------------- Entry -------------
 
