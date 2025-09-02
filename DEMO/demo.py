@@ -161,6 +161,10 @@ if st.button("🚀 Start Streaming Detection"):
     consecutive_displayed = 0
     samples_displayed = 0
 
+
+    chunk_skip = 20  # how many rows to skip at once when threshold is exceeded
+
+
     for i in range(len(features_df)):
         row = features_normalized.iloc[i]
         true_label = int(labels_df.iloc[i])
@@ -178,7 +182,7 @@ if st.button("🚀 Start Streaming Detection"):
         with torch.no_grad():
             y_pred_logit = model(x)
             y_pred_prob = torch.sigmoid(y_pred_logit).item()
-            threshold = 0.3
+            threshold = 0.45 #best threshold from experiments (hardcoded for now)
             pred_label = 1 if y_pred_prob > threshold else 0
 
         # Honest metrics
@@ -195,6 +199,7 @@ if st.button("🚀 Start Streaming Detection"):
             consecutive_displayed += 1
             if consecutive_displayed > skip_consecutive_after:
                 display_this = False
+                i += chunk_skip - 1  # -1 because loop will increment i anyway
         else:
             consecutive_displayed = 1
             last_displayed_label = pred_label
