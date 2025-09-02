@@ -1,0 +1,18 @@
+{
+    "epochs": 100,
+    "sequence_length": 128,
+    "pos_weight": 0.88654,
+    "num_layers": 1,
+    "min_delta": 1.4444e-06,
+    "lr": 0.00011505,
+    "l2_reg": 3.4745e-05,
+    "l1_reg": 7.2167e-05,
+    "early_stopping_patience": 35,
+    "hidden_dim": 4,
+    "gradient_clip": 4.21752,
+    "dropout": 0.29761,
+    "batch_size": 512,
+    "bidirectional": true,
+    "use_attention": true,
+    "wandb_project": "lstm-cybersecurity-fixed"
+}
